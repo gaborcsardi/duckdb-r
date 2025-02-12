@@ -10,6 +10,7 @@
 #include "parquet_statistics.hpp"
 #include "parquet_writer.hpp"
 #ifndef DUCKDB_AMALGAMATION
+#include "duckdb/common/bitpacking.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/serializer/buffered_file_writer.hpp"
@@ -79,41 +80,25 @@ string ColumnWriterStatistics::GetMaxValue() {
 // RleBpEncoder
 //===--------------------------------------------------------------------===//
 RleBpEncoder::RleBpEncoder(uint32_t bit_width)
-    : byte_width((bit_width + 7) / 8), byte_count(idx_t(-1)), run_count(idx_t(-1)) {
-}
-
-// we always RLE everything (for now)
-void RleBpEncoder::BeginPrepare(uint32_t first_value) {
-	byte_count = 0;
-	run_count = 1;
-	current_run_count = 1;
-	last_value = first_value;
-}
-
-void RleBpEncoder::FinishRun() {
-	// last value, or value has changed
-	// write out the current run
-	byte_count += ParquetDecodeUtils::GetVarintSize(current_run_count << 1) + byte_width;
-	current_run_count = 1;
-	run_count++;
-}
-
-void RleBpEncoder::PrepareValue(uint32_t value) {
-	if (value != last_value) {
-		FinishRun();
-		last_value = value;
-	} else {
-		current_run_count++;
-	}
-}
-
-void RleBpEncoder::FinishPrepare() {
-	FinishRun();
-}
-
-idx_t RleBpEncoder::GetByteCount() {
-	D_ASSERT(byte_count != idx_t(-1));
-	return byte_count;
+    : bit_width(bit_width), byte_width((bit_width + 7) / 8),
+	  byte_count(idx_t(-1)), run_count(idx_t(-1)) {
+	// The minimum number of repeats for an RLE run
+	switch(bit_width) {
+	case 0:
+	case 1:
+		min_repeat = 8;
+		break;
+	case 2:
+		min_repeat = 6;
+		break;
+	case 3:
+	case 4:
+		min_repeat = 4;
+		break;
+	default:
+		min_repeat = 3;
+		break;
+	};
 }
 
 void RleBpEncoder::BeginWrite(WriteStream &writer, uint32_t first_value) {
@@ -122,7 +107,7 @@ void RleBpEncoder::BeginWrite(WriteStream &writer, uint32_t first_value) {
 	current_run_count = 1;
 }
 
-void RleBpEncoder::WriteRun(WriteStream &writer) {
+void RleBpEncoder::WriteRLERun(WriteStream &writer) {
 	// write the header of the run
 	ParquetDecodeUtils::VarintEncode(current_run_count << 1, writer);
 	// now write the value
@@ -150,7 +135,7 @@ void RleBpEncoder::WriteRun(WriteStream &writer) {
 
 void RleBpEncoder::WriteValue(WriteStream &writer, uint32_t value) {
 	if (value != last_value) {
-		WriteRun(writer);
+		WriteRLERun(writer);
 		last_value = value;
 	} else {
 		current_run_count++;
@@ -158,8 +143,111 @@ void RleBpEncoder::WriteValue(WriteStream &writer, uint32_t value) {
 }
 
 void RleBpEncoder::FinishWrite(WriteStream &writer) {
-	WriteRun(writer);
+	WriteRLERun(writer);
 }
+
+void RleBpEncoder::WriteBPRun(WriteStream &writer, const uint16_t *values, uint32_t count) {
+	int pad = (8 - count % 8) % 8;
+	ParquetDecodeUtils::VarintEncode((((count + pad) / 8) << 1) | 1, writer);
+	vector<uint8_t> tgt(bit_width * 4);
+	while (count >= 32) {
+		BitpackingPrimitives::PackBuffer<uint16_t, true>(tgt.data(), (uint16_t *) values, 32, bit_width);
+		for (auto i = 0; i < bit_width * 4; i++) {
+			writer.Write<uint8_t>(tgt[i]);
+		}
+		values += 32;
+		count -= 32;
+	}
+	if (count > 0) {
+		BitpackingPrimitives::PackBuffer<uint16_t, true>(tgt.data(), (uint16_t*) values, count, bit_width);
+		int packed_len = bit_width * (count + pad) / 8;
+		for (auto i = 0; i < packed_len; i++) {
+			writer.Write<uint8_t>(tgt[i]);
+		}
+	}
+}
+
+idx_t RleBpEncoder::GetByteCount(const uint16_t *values, uint32_t num_values) {
+	byte_count = 0;
+	uint32_t iidx = 0;
+	while (iidx < num_values) {
+		// search for a repeated value that starts at an 8-block, and
+		// is repeated at least min_reps times;
+		uint32_t rleidx = iidx;
+		while (rleidx < num_values) {
+			uint32_t sidx = rleidx;
+			current_run_count = 1;
+			last_value = values[sidx++];
+			while (sidx < num_values && values[sidx++] == last_value) {
+				current_run_count++;
+			}
+			if (current_run_count >= min_repeat) {
+				// we have a repeat from rleidx, until then it is BP, then RLE
+				if (rleidx > iidx) {
+					byte_count += ParquetDecodeUtils::GetVarintSize(((rleidx - iidx) / 8) << 1 | 1);
+					byte_count += (rleidx - iidx) / 8 * bit_width;
+					iidx = rleidx;
+				}
+				byte_count += ParquetDecodeUtils::GetVarintSize(current_run_count << 1) + byte_width;
+				iidx += current_run_count;
+				break;
+			} else {
+				rleidx += 8;
+			}
+		}
+		if (rleidx >= num_values) {
+			// if we didn't find any RLE then BP until the end
+			uint32_t num = num_values - iidx;
+			// we pad it to a multiple of eight
+			int pad = (8 - num % 8) % 8;
+			byte_count += ParquetDecodeUtils::GetVarintSize(((num + pad) / 8) << 1 | 1);
+			byte_count += (num + pad) / 8 * bit_width;
+			iidx = num_values;
+		}
+	}
+
+	return byte_count;
+}
+
+void RleBpEncoder::WriteValues(WriteStream &writer, const uint16_t *values, uint32_t num_values) {
+	uint32_t iidx = 0;
+	while (iidx < num_values) {
+		// search for a repeated value that starts at an 8-block, and
+		// is repeated at least min_reps times;
+		uint32_t rleidx = iidx;
+		while (rleidx < num_values) {
+			uint32_t sidx = rleidx;
+			current_run_count = 1;
+			last_value = values[sidx++];
+			while (sidx < num_values && values[sidx++] == last_value) {
+				current_run_count++;
+			}
+			if (current_run_count >= min_repeat) {
+				// we have a repeat from rleidx, until then it is BP, then RLE
+				if (rleidx > iidx) {
+					WriteBPRun(writer, values + iidx, rleidx - iidx);
+					iidx = rleidx;
+				}
+				iidx += current_run_count; // before WriteRLERun()'s reset!
+				WriteRLERun(writer);
+				break;
+			} else {
+				rleidx += 8;
+			}
+		}
+
+		if (rleidx >= num_values) {
+			// if we didn't find any RLE then BP until the end
+			WriteBPRun(writer, values + iidx, num_values - iidx);
+			iidx = num_values;
+		}
+	}
+}
+
+void RleBpEncoder::WriteValues(WriteStream &writer, FlatVector &values) {
+	// TODO
+}
+
 
 //===--------------------------------------------------------------------===//
 // ColumnWriter
@@ -524,19 +612,9 @@ void BasicColumnWriter::WriteLevels(WriteStream &temp_writer, const unsafe_vecto
 	auto bit_width = RleBpDecoder::ComputeBitWidth((max_value));
 	RleBpEncoder rle_encoder(bit_width);
 
-	rle_encoder.BeginPrepare(levels[offset]);
-	for (idx_t i = offset + 1; i < offset + count; i++) {
-		rle_encoder.PrepareValue(levels[i]);
-	}
-	rle_encoder.FinishPrepare();
-
 	// start off by writing the byte count as a uint32_t
-	temp_writer.Write<uint32_t>(rle_encoder.GetByteCount());
-	rle_encoder.BeginWrite(temp_writer, levels[offset]);
-	for (idx_t i = offset + 1; i < offset + count; i++) {
-		rle_encoder.WriteValue(temp_writer, levels[i]);
-	}
-	rle_encoder.FinishWrite(temp_writer);
+	temp_writer.Write<uint32_t>(rle_encoder.GetByteCount(&levels[offset], count));
+	rle_encoder.WriteValues(temp_writer, &levels[offset], count);
 }
 
 void BasicColumnWriter::NextPage(BasicColumnWriterState &state) {

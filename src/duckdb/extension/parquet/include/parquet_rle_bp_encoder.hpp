@@ -19,22 +19,19 @@ public:
 	explicit RleBpEncoder(uint32_t bit_width);
 
 public:
-	//! NOTE: Prepare is only required if a byte count is required BEFORE writing
-	//! This is the case with e.g. writing repetition/definition levels
-	//! If GetByteCount() is not required, prepare can be safely skipped
-	void BeginPrepare(uint32_t first_value);
-	void PrepareValue(uint32_t value);
-	void FinishPrepare();
+	idx_t GetByteCount(const uint16_t *values, uint32_t num_values);
+	void WriteValues(WriteStream &writer, const uint16_t *values, uint32_t num_values);
+	void WriteValues(WriteStream &writer, FlatVector &values);
 
 	void BeginWrite(WriteStream &writer, uint32_t first_value);
 	void WriteValue(WriteStream &writer, uint32_t value);
 	void FinishWrite(WriteStream &writer);
 
-	idx_t GetByteCount();
-
 private:
 	//! meta information
+	uint32_t bit_width;
 	uint32_t byte_width;
+	uint32_t min_repeat;
 	//! RLE run information
 	idx_t byte_count;
 	idx_t run_count;
@@ -43,7 +40,9 @@ private:
 
 private:
 	void FinishRun();
-	void WriteRun(WriteStream &writer);
+	void WriteRLERun(WriteStream &writer);
+	void WriteBPRun(WriteStream &writer, const uint16_t *values, uint32_t count);
+
 };
 
 } // namespace duckdb
