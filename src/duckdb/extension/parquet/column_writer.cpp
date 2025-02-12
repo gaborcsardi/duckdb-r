@@ -168,46 +168,58 @@ void RleBpEncoder::WriteBPRun(WriteStream &writer, const T *values, idx_t count)
 	}
 }
 
+struct RleBpRuns {
+	idx_t bp_start;
+	idx_t bp_len;
+	idx_t rle_start;
+	idx_t rle_len;
+};
+
+
+template <typename T>
+static inline RleBpRuns find_next_runs(const T *values, idx_t from, idx_t until, uint32_t min_repeat) {
+	RleBpRuns runs = { from, 0, from, 0 };
+	while (runs.rle_start < until) {
+		// count repeated values from rle_start
+		idx_t rle_end = runs.rle_start;
+		uint32_t rep_value = values[rle_end++];
+		runs.rle_len = 1;
+		while (rle_end < until && values[rle_end++] == rep_value) {
+			runs.rle_len++;
+		}
+		if (runs.rle_len >= min_repeat) {
+			// if we have enough, then we are done
+			return runs;
+		} else {
+			// otherwise we need to bit pack 8 more values from rle_start
+			// and continue looking for repeated values
+			// at the end we might have less than 8 values
+			runs.bp_len += runs.rle_start + 8 > until ? until - runs.rle_start : 8;
+			runs.rle_start += 8;
+			runs.rle_len = 0;
+		}
+	}
+	// didn't find a repeat, bit pack the rest
+	return runs;
+}
+
 template <typename T>
 idx_t RleBpEncoder::GetByteCount(const T *values, idx_t num_values) {
 	byte_count = 0;
 	idx_t iidx = 0;
 	while (iidx < num_values) {
-		// search for a repeated value that starts at an 8-block, and
-		// is repeated at least min_reps times;
-		idx_t rleidx = iidx;
-		while (rleidx < num_values) {
-			idx_t sidx = rleidx;
-			current_run_count = 1;
-			last_value = values[sidx++];
-			while (sidx < num_values && values[sidx++] == last_value) {
-				current_run_count++;
-			}
-			if (current_run_count >= min_repeat) {
-				// we have a repeat from rleidx, until then it is BP, then RLE
-				if (rleidx > iidx) {
-					byte_count += ParquetDecodeUtils::GetVarintSize(((rleidx - iidx) / 8) << 1 | 1);
-					byte_count += (rleidx - iidx) / 8 * bit_width;
-					iidx = rleidx;
-				}
-				byte_count += ParquetDecodeUtils::GetVarintSize(current_run_count << 1) + byte_width;
-				iidx += current_run_count;
-				break;
-			} else {
-				rleidx += 8;
-			}
+		RleBpRuns runs = find_next_runs(values, iidx, num_values, min_repeat);
+		if (runs.bp_len > 0) {
+			byte_count += ParquetDecodeUtils::GetVarintSize((runs.bp_len / 8) << 1 | 1);
+			idx_t pad = (8 - runs.bp_len % 8) % 8;
+			byte_count += (runs.bp_len + pad) / 8 * bit_width;
+			iidx += runs.bp_len;
 		}
-		if (rleidx >= num_values) {
-			// if we didn't find any RLE then BP until the end
-			idx_t num = num_values - iidx;
-			// we pad it to a multiple of eight
-			idx_t pad = (8 - num % 8) % 8;
-			byte_count += ParquetDecodeUtils::GetVarintSize(((num + pad) / 8) << 1 | 1);
-			byte_count += (num + pad) / 8 * bit_width;
-			iidx = num_values;
+		if (runs.rle_len > 0) {
+			byte_count += ParquetDecodeUtils::GetVarintSize(runs.rle_len << 1) + byte_width;
+			iidx += runs.rle_len;
 		}
 	}
-
 	return byte_count;
 }
 
