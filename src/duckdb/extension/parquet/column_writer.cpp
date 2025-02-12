@@ -146,12 +146,13 @@ void RleBpEncoder::FinishWrite(WriteStream &writer) {
 	WriteRLERun(writer);
 }
 
-void RleBpEncoder::WriteBPRun(WriteStream &writer, const uint16_t *values, uint32_t count) {
+template<typename T>
+void RleBpEncoder::WriteBPRun(WriteStream &writer, const T *values, uint32_t count) {
 	int pad = (8 - count % 8) % 8;
 	ParquetDecodeUtils::VarintEncode((((count + pad) / 8) << 1) | 1, writer);
 	vector<uint8_t> tgt(bit_width * 4);
 	while (count >= 32) {
-		BitpackingPrimitives::PackBuffer<uint16_t, true>(tgt.data(), (uint16_t *) values, 32, bit_width);
+		BitpackingPrimitives::PackBuffer<T, true>(tgt.data(), (T *) values, 32, bit_width);
 		for (auto i = 0; i < bit_width * 4; i++) {
 			writer.Write<uint8_t>(tgt[i]);
 		}
@@ -159,7 +160,7 @@ void RleBpEncoder::WriteBPRun(WriteStream &writer, const uint16_t *values, uint3
 		count -= 32;
 	}
 	if (count > 0) {
-		BitpackingPrimitives::PackBuffer<uint16_t, true>(tgt.data(), (uint16_t*) values, count, bit_width);
+		BitpackingPrimitives::PackBuffer<T, false>(tgt.data(), (T*) values, count, bit_width);
 		int packed_len = bit_width * (count + pad) / 8;
 		for (auto i = 0; i < packed_len; i++) {
 			writer.Write<uint8_t>(tgt[i]);
@@ -167,7 +168,8 @@ void RleBpEncoder::WriteBPRun(WriteStream &writer, const uint16_t *values, uint3
 	}
 }
 
-idx_t RleBpEncoder::GetByteCount(const uint16_t *values, uint32_t num_values) {
+template <typename T>
+idx_t RleBpEncoder::GetByteCount(const T *values, uint32_t num_values) {
 	byte_count = 0;
 	uint32_t iidx = 0;
 	while (iidx < num_values) {
@@ -209,7 +211,8 @@ idx_t RleBpEncoder::GetByteCount(const uint16_t *values, uint32_t num_values) {
 	return byte_count;
 }
 
-void RleBpEncoder::WriteValues(WriteStream &writer, const uint16_t *values, uint32_t num_values) {
+template <typename T>
+void RleBpEncoder::WriteValues(WriteStream &writer, const T *values, uint32_t num_values) {
 	uint32_t iidx = 0;
 	while (iidx < num_values) {
 		// search for a repeated value that starts at an 8-block, and
@@ -244,8 +247,9 @@ void RleBpEncoder::WriteValues(WriteStream &writer, const uint16_t *values, uint
 	}
 }
 
-void RleBpEncoder::WriteValues(WriteStream &writer, FlatVector &values) {
-	// TODO
+template <typename T>
+void RleBpEncoder::WriteValues(WriteStream &writer, const T* data, const ValidityMask &mask, idx_t from, idx_t until) {
+
 }
 
 
@@ -613,8 +617,8 @@ void BasicColumnWriter::WriteLevels(WriteStream &temp_writer, const unsafe_vecto
 	RleBpEncoder rle_encoder(bit_width);
 
 	// start off by writing the byte count as a uint32_t
-	temp_writer.Write<uint32_t>(rle_encoder.GetByteCount(&levels[offset], count));
-	rle_encoder.WriteValues(temp_writer, &levels[offset], count);
+	temp_writer.Write<uint32_t>(rle_encoder.GetByteCount<uint16_t>(&levels[offset], count));
+	rle_encoder.WriteValues<uint16_t>(temp_writer, &levels[offset], count);
 }
 
 void BasicColumnWriter::NextPage(BasicColumnWriterState &state) {

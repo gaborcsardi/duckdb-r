@@ -19,9 +19,12 @@ public:
 	explicit RleBpEncoder(uint32_t bit_width);
 
 public:
-	idx_t GetByteCount(const uint16_t *values, uint32_t num_values);
-	void WriteValues(WriteStream &writer, const uint16_t *values, uint32_t num_values);
-	void WriteValues(WriteStream &writer, FlatVector &values);
+	template <typename T>
+	idx_t GetByteCount(const T *values, uint32_t num_values);
+	template <typename T>
+	void WriteValues(WriteStream &writer, const T *values, uint32_t num_values);
+	template <typename T>
+	void WriteValues(WriteStream &writer, const T* data, const ValidityMask &mask, idx_t from, idx_t until);
 
 	void BeginWrite(WriteStream &writer, uint32_t first_value);
 	void WriteValue(WriteStream &writer, uint32_t value);
@@ -41,7 +44,8 @@ private:
 private:
 	void FinishRun();
 	void WriteRLERun(WriteStream &writer);
-	void WriteBPRun(WriteStream &writer, const uint16_t *values, uint32_t count);
+	template<typename T>
+	void WriteBPRun(WriteStream &writer, const T *values, uint32_t count);
 
 };
 
