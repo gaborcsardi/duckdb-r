@@ -147,7 +147,7 @@ void RleBpEncoder::FinishWrite(WriteStream &writer) {
 }
 
 template<typename T>
-void RleBpEncoder::WriteBPRun(WriteStream &writer, const T *values, uint32_t count) {
+void RleBpEncoder::WriteBPRun(WriteStream &writer, const T *values, idx_t count) {
 	int pad = (8 - count % 8) % 8;
 	ParquetDecodeUtils::VarintEncode((((count + pad) / 8) << 1) | 1, writer);
 	vector<uint8_t> tgt(bit_width * 4);
@@ -169,15 +169,15 @@ void RleBpEncoder::WriteBPRun(WriteStream &writer, const T *values, uint32_t cou
 }
 
 template <typename T>
-idx_t RleBpEncoder::GetByteCount(const T *values, uint32_t num_values) {
+idx_t RleBpEncoder::GetByteCount(const T *values, idx_t num_values) {
 	byte_count = 0;
-	uint32_t iidx = 0;
+	idx_t iidx = 0;
 	while (iidx < num_values) {
 		// search for a repeated value that starts at an 8-block, and
 		// is repeated at least min_reps times;
-		uint32_t rleidx = iidx;
+		idx_t rleidx = iidx;
 		while (rleidx < num_values) {
-			uint32_t sidx = rleidx;
+			idx_t sidx = rleidx;
 			current_run_count = 1;
 			last_value = values[sidx++];
 			while (sidx < num_values && values[sidx++] == last_value) {
@@ -199,9 +199,9 @@ idx_t RleBpEncoder::GetByteCount(const T *values, uint32_t num_values) {
 		}
 		if (rleidx >= num_values) {
 			// if we didn't find any RLE then BP until the end
-			uint32_t num = num_values - iidx;
+			idx_t num = num_values - iidx;
 			// we pad it to a multiple of eight
-			int pad = (8 - num % 8) % 8;
+			idx_t pad = (8 - num % 8) % 8;
 			byte_count += ParquetDecodeUtils::GetVarintSize(((num + pad) / 8) << 1 | 1);
 			byte_count += (num + pad) / 8 * bit_width;
 			iidx = num_values;
@@ -212,14 +212,14 @@ idx_t RleBpEncoder::GetByteCount(const T *values, uint32_t num_values) {
 }
 
 template <typename T>
-void RleBpEncoder::WriteValues(WriteStream &writer, const T *values, uint32_t num_values) {
-	uint32_t iidx = 0;
+void RleBpEncoder::WriteValues(WriteStream &writer, const T *values, idx_t num_values) {
+	idx_t iidx = 0;
 	while (iidx < num_values) {
 		// search for a repeated value that starts at an 8-block, and
 		// is repeated at least min_reps times;
-		uint32_t rleidx = iidx;
+		idx_t rleidx = iidx;
 		while (rleidx < num_values) {
-			uint32_t sidx = rleidx;
+			idx_t sidx = rleidx;
 			current_run_count = 1;
 			last_value = values[sidx++];
 			while (sidx < num_values && values[sidx++] == last_value) {

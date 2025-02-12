@@ -20,9 +20,9 @@ public:
 
 public:
 	template <typename T>
-	idx_t GetByteCount(const T *values, uint32_t num_values);
+	idx_t GetByteCount(const T *values, idx_t num_values);
 	template <typename T>
-	void WriteValues(WriteStream &writer, const T *values, uint32_t num_values);
+	void WriteValues(WriteStream &writer, const T *values, idx_t num_values);
 	template <typename T>
 	void WriteValues(WriteStream &writer, const T* data, const ValidityMask &mask, idx_t from, idx_t until);
 
@@ -45,7 +45,7 @@ private:
 	void FinishRun();
 	void WriteRLERun(WriteStream &writer);
 	template<typename T>
-	void WriteBPRun(WriteStream &writer, const T *values, uint32_t count);
+	void WriteBPRun(WriteStream &writer, const T *values, idx_t count);
 
 };
 
