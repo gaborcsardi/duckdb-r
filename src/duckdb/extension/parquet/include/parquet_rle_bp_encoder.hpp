@@ -14,36 +14,57 @@
 
 namespace duckdb {
 
+class RleBpBuffer {
+public:
+	explicit RleBpBuffer();
+	idx_t needs();
+	void reserve(idx_t size);
+	void push_back(uint32_t elem);
+	idx_t size();
+	const uint32_t *data();
+	void clear();
+	bool is_full();
+
+private:
+	std::vector<uint32_t> buf;
+	idx_t needs_;
+	idx_t capacity_;
+};
+
 class RleBpEncoder {
 public:
 	explicit RleBpEncoder(uint32_t bit_width);
 
 public:
-	//! NOTE: Prepare is only required if a byte count is required BEFORE writing
-	//! This is the case with e.g. writing repetition/definition levels
-	//! If GetByteCount() is not required, prepare can be safely skipped
-	void BeginPrepare(uint32_t first_value);
-	void PrepareValue(uint32_t value);
-	void FinishPrepare();
+	// vectorized API
+	template <typename T>
+	idx_t GetByteCount(const T *values, idx_t num_values);
+	template <typename T>
+	void WriteValues(WriteStream &writer, const T *values, idx_t num_values);
 
-	void BeginWrite(WriteStream &writer, uint32_t first_value);
+	// element-wise API
+	void BeginWrite(WriteStream &writer, uint32_t first_value, idx_t num_values);
 	void WriteValue(WriteStream &writer, uint32_t value);
 	void FinishWrite(WriteStream &writer);
 
-	idx_t GetByteCount();
-
 private:
 	//! meta information
+	uint32_t bit_width;
 	uint32_t byte_width;
+	uint32_t min_repeat;
+
 	//! RLE run information
-	idx_t byte_count;
-	idx_t run_count;
+	RleBpBuffer bp_buf;
 	idx_t current_run_count;
 	uint32_t last_value;
 
 private:
-	void FinishRun();
-	void WriteRun(WriteStream &writer);
+	template<typename T>
+	void WriteBpRun(WriteStream &writer, const T *values, idx_t count);
+	template<typename T>
+	void WriteRleRun(WriteStream &writer, T value, idx_t count);
+
+	void WriteBpBuffer(WriteStream &writer);
 };
 
 } // namespace duckdb

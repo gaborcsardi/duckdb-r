@@ -10,6 +10,7 @@
 #include "parquet_statistics.hpp"
 #include "parquet_writer.hpp"
 #ifndef DUCKDB_AMALGAMATION
+#include "duckdb/common/bitpacking.hpp"
 #include "duckdb/common/exception.hpp"
 #include "duckdb/common/operator/comparison_operators.hpp"
 #include "duckdb/common/serializer/buffered_file_writer.hpp"
@@ -76,89 +77,294 @@ string ColumnWriterStatistics::GetMaxValue() {
 }
 
 //===--------------------------------------------------------------------===//
-// RleBpEncoder
+// RleBpBuffer, RleBpEncoder
 //===--------------------------------------------------------------------===//
-RleBpEncoder::RleBpEncoder(uint32_t bit_width)
-    : byte_width((bit_width + 7) / 8), byte_count(idx_t(-1)), run_count(idx_t(-1)) {
+
+// This is a thin wrapper on std::vector<uint32_t>, with two tweaks:
+// - It knows how many more values the vector needs to have a
+//   multiple of 8 values. This is important because we can only bit-pack
+//   a multiple of 8 values in Parquet RLE/BP.
+// - It has a limited capacity, and it errors if we try to push more values
+//   into it. This is to avoid the vector from growing too long. It means
+//   that we might write two ore more consecutive BP runs, so the result
+//   won't be optimal. But a few extra bytes for each BP run are OK, as
+//   long as the runs are long enough. (E.g. 3-4 extra bytes for every
+//   128k bit packged values currently.) We need to check if the vector
+//   is full after each `push_back()` call!
+
+RleBpBuffer::RleBpBuffer() : needs_(0) {
 }
 
-// we always RLE everything (for now)
-void RleBpEncoder::BeginPrepare(uint32_t first_value) {
-	byte_count = 0;
-	run_count = 1;
-	current_run_count = 1;
-	last_value = first_value;
+idx_t RleBpBuffer::needs() {
+	return needs_;
 }
 
-void RleBpEncoder::FinishRun() {
-	// last value, or value has changed
-	// write out the current run
-	byte_count += ParquetDecodeUtils::GetVarintSize(current_run_count << 1) + byte_width;
-	current_run_count = 1;
-	run_count++;
+void RleBpBuffer::reserve(idx_t size) {
+	buf.reserve(size);
+	capacity_ = size;
 }
 
-void RleBpEncoder::PrepareValue(uint32_t value) {
-	if (value != last_value) {
-		FinishRun();
-		last_value = value;
+void RleBpBuffer::push_back(uint32_t elem) {
+	if (is_full()) {
+		throw InternalException("Internal error, RLE/BP buffer is full");
+	}
+	buf.push_back(elem);
+	if (needs_ > 0) {
+		needs_--;
 	} else {
-		current_run_count++;
+		needs_ = 7;
 	}
 }
 
-void RleBpEncoder::FinishPrepare() {
-	FinishRun();
+idx_t RleBpBuffer::size() {
+	return buf.size();
 }
 
-idx_t RleBpEncoder::GetByteCount() {
-	D_ASSERT(byte_count != idx_t(-1));
-	return byte_count;
+const uint32_t *RleBpBuffer::data() {
+	return buf.data();
 }
 
-void RleBpEncoder::BeginWrite(WriteStream &writer, uint32_t first_value) {
-	// start the RLE runs
-	last_value = first_value;
-	current_run_count = 1;
+void RleBpBuffer::clear() {
+	buf.clear();
+	needs_ = 0;
 }
 
-void RleBpEncoder::WriteRun(WriteStream &writer) {
-	// write the header of the run
-	ParquetDecodeUtils::VarintEncode(current_run_count << 1, writer);
-	// now write the value
-	D_ASSERT(last_value >> (byte_width * 8) == 0);
-	switch (byte_width) {
+bool RleBpBuffer::is_full() {
+	return buf.size() == capacity_;
+}
+
+// constructor for both APIs
+
+RleBpEncoder::RleBpEncoder(uint32_t bit_width)
+    : bit_width(bit_width), byte_width((bit_width + 7) / 8) {
+	// The minimum number of repeats for an RLE run. It is not worth
+	// writing shorter repeats, it is better to bit-pack them.
+	switch(bit_width) {
+	case 0:
 	case 1:
-		writer.Write<uint8_t>(last_value);
+		min_repeat = 8;
 		break;
 	case 2:
-		writer.Write<uint16_t>(last_value);
+		min_repeat = 6;
 		break;
 	case 3:
-		writer.Write<uint8_t>(last_value & 0xFF);
-		writer.Write<uint8_t>((last_value >> 8) & 0xFF);
-		writer.Write<uint8_t>((last_value >> 16) & 0xFF);
-		break;
 	case 4:
-		writer.Write<uint32_t>(last_value);
+		min_repeat = 4;
 		break;
 	default:
-		throw InternalException("unsupported byte width for RLE encoding");
+		min_repeat = 3;
+		break;
+	};
+}
+
+// element-wise API
+
+void RleBpEncoder::BeginWrite(WriteStream &writer, uint32_t first_value, idx_t num_values) {
+	idx_t max_buffer_size = 128 * 1024; // has to be a multiple of 8
+	if (num_values < max_buffer_size) {
+		max_buffer_size = num_values;
 	}
+	bp_buf.reserve(max_buffer_size);
+	last_value = first_value;
 	current_run_count = 1;
 }
 
+// We search for an RLE run that is at least `min_repeat` long. Otherwise
+// it is not worth creating an RLE run. All values before such RLE run will
+// form a BP run.
+
 void RleBpEncoder::WriteValue(WriteStream &writer, uint32_t value) {
-	if (value != last_value) {
-		WriteRun(writer);
+	if (bp_buf.needs() != 0) {
+		// we are collecting values to complete a BP run to a multiple of 8
+		bp_buf.push_back(value);
+		if (bp_buf.is_full()) {
+			WriteBpBuffer(writer);
+		}
+	} else if (current_run_count == 0) {
+		// otherwise, maybe starting a potential RLE run
 		last_value = value;
-	} else {
 		current_run_count++;
+	} else if (value == last_value) {
+		// or continuing a potential RLE run
+		current_run_count++;
+	} else if (current_run_count < min_repeat) {
+		// failed to have enough values for an RLE run, they go to BP
+		for (; current_run_count > 0; current_run_count--) {
+			bp_buf.push_back(last_value);
+			if (bp_buf.is_full()) {
+				WriteBpBuffer(writer);
+			}
+		}
+		// new value might be needed in BP
+		if (bp_buf.needs() != 0) {
+			bp_buf.push_back(value);
+			if (bp_buf.is_full()) {
+				WriteBpBuffer(writer);
+			}
+		} else {
+			last_value = value;
+			current_run_count = 1;
+		}
+	} else {
+		// found an RLE run, write out BP & RLE, and start new RLE run
+		WriteBpBuffer(writer);
+		WriteRleRun<uint32_t>(writer, last_value, current_run_count);
+		last_value = value;
+		current_run_count = 1;
 	}
 }
 
 void RleBpEncoder::FinishWrite(WriteStream &writer) {
-	WriteRun(writer);
+	// See if we have enough values for an RLE run. If not, then add the
+	// last values to a BP run.
+	if (current_run_count < min_repeat) {
+		for (; current_run_count > 0; current_run_count--) {
+			bp_buf.push_back(last_value);
+			if (bp_buf.is_full()) {
+				WriteBpBuffer(writer);
+			}
+		}
+	}
+	WriteBpBuffer(writer);
+	if (current_run_count >= min_repeat) {
+		WriteRleRun<uint32_t>(writer, last_value, current_run_count);
+	}
+}
+
+void RleBpEncoder::WriteBpBuffer(WriteStream &writer) {
+	if (bp_buf.size() == 0) {
+		return;
+	}
+	WriteBpRun<uint32_t>(writer, bp_buf.data(), bp_buf.size());
+	bp_buf.clear();
+}
+
+// vectorized API
+
+struct RleBpRuns {
+	idx_t bp_start;
+	idx_t bp_len;
+	idx_t rle_start;
+	idx_t rle_len;
+};
+
+// Search for an RLE run in `values`, that starts at a multiple of 8, and
+// is at least `min_repeat` long. The values before such RLE run will form
+// a BP run. (Unless the RLE run starts right away.)
+
+template <typename T>
+static inline RleBpRuns find_next_runs(const T *values, idx_t from, idx_t until, uint32_t min_repeat) {
+	RleBpRuns runs = { from, 0, from, 0 };
+	while (runs.rle_start < until) {
+		// count repeated values from rle_start
+		idx_t rle_end = runs.rle_start;
+		uint32_t rep_value = values[rle_end++];
+		runs.rle_len = 1;
+		while (rle_end < until && values[rle_end++] == rep_value) {
+			runs.rle_len++;
+		}
+		if (runs.rle_len >= min_repeat) {
+			// if we have enough, then we are done
+			return runs;
+		} else {
+			// Otherwise we need to bit pack 8 more values from rle_start
+			// and continue looking for repeated values.
+			// At the end we might have less than 8 values.
+			runs.bp_len += runs.rle_start + 8 > until ? until - runs.rle_start : 8;
+			runs.rle_start += 8;
+			runs.rle_len = 0;
+		}
+	}
+	// didn't find a repeat, bit pack the rest
+	return runs;
+}
+
+template <typename T>
+idx_t RleBpEncoder::GetByteCount(const T *values, idx_t num_values) {
+	idx_t byte_count = 0;
+	idx_t iidx = 0;
+	while (iidx < num_values) {
+		RleBpRuns runs = find_next_runs(values, iidx, num_values, min_repeat);
+		if (runs.bp_len > 0) {
+			byte_count += ParquetDecodeUtils::GetVarintSize((runs.bp_len / 8) << 1 | 1);
+			idx_t pad = (8 - runs.bp_len % 8) % 8;
+			byte_count += (runs.bp_len + pad) / 8 * bit_width;
+			iidx += runs.bp_len;
+		}
+		if (runs.rle_len > 0) {
+			byte_count += ParquetDecodeUtils::GetVarintSize(runs.rle_len << 1) + byte_width;
+			iidx += runs.rle_len;
+		}
+	}
+	return byte_count;
+}
+
+template <typename T>
+void RleBpEncoder::WriteValues(WriteStream &writer, const T *values, idx_t num_values) {
+	idx_t iidx = 0;
+	while (iidx < num_values) {
+		RleBpRuns runs = find_next_runs(values, iidx, num_values, min_repeat);
+		if (runs.bp_len > 0) {
+			WriteBpRun(writer, values + runs.bp_start, runs.bp_len);
+			iidx += runs.bp_len;
+		}
+		if (runs.rle_len > 0) {
+			WriteRleRun(writer, values[runs.rle_start], runs.rle_len);
+			iidx += runs.rle_len;
+		}
+	}
+}
+
+// common internal functions
+
+template<typename T>
+void RleBpEncoder::WriteBpRun(WriteStream &writer, const T *values, idx_t count) {
+	int pad = (8 - count % 8) % 8;
+	ParquetDecodeUtils::VarintEncode((((count + pad) / 8) << 1) | 1, writer);
+	vector<uint8_t> tgt(bit_width * 4);
+	// BitpackingPrimitives::PackBuffer is more efficient packing 32 values,
+	// keep doing that until less than 32 are left.
+	while (count >= 32) {
+		BitpackingPrimitives::PackBuffer<T, true>(tgt.data(), (T *) values, 32, bit_width);
+		for (auto i = 0; i < bit_width * 4; i++) {
+			writer.Write<uint8_t>(tgt[i]);
+		}
+		values += 32;
+		count -= 32;
+	}
+	// And the rest, padded to a multiple of 8, as RLE/BP can only bit-pack
+	// multiples of 8.
+	if (count > 0) {
+		BitpackingPrimitives::PackBuffer<T, false>(tgt.data(), (T*) values, count, bit_width);
+		int packed_len = bit_width * (count + pad) / 8;
+		for (auto i = 0; i < packed_len; i++) {
+			writer.Write<uint8_t>(tgt[i]);
+		}
+	}
+}
+
+template<typename T>
+void RleBpEncoder::WriteRleRun(WriteStream &writer, T value, idx_t count) {
+	uint32_t value32 = value;
+	ParquetDecodeUtils::VarintEncode(count << 1, writer);
+	switch (byte_width) {
+	case 1:
+		writer.Write<uint8_t>(value32);
+		break;
+	case 2:
+		writer.Write<uint16_t>(value32);
+		break;
+	case 3:
+		writer.Write<uint8_t>(value32 & 0xFF);
+		writer.Write<uint8_t>((value32 >> 8) & 0xFF);
+		writer.Write<uint8_t>((value32 >> 16) & 0xFF);
+		break;
+	case 4:
+		writer.Write<uint32_t>(value32);
+		break;
+	default:
+		throw InternalException("unsupported byte width for RLE encoding");
+	}
 }
 
 //===--------------------------------------------------------------------===//
@@ -524,19 +730,9 @@ void BasicColumnWriter::WriteLevels(WriteStream &temp_writer, const unsafe_vecto
 	auto bit_width = RleBpDecoder::ComputeBitWidth((max_value));
 	RleBpEncoder rle_encoder(bit_width);
 
-	rle_encoder.BeginPrepare(levels[offset]);
-	for (idx_t i = offset + 1; i < offset + count; i++) {
-		rle_encoder.PrepareValue(levels[i]);
-	}
-	rle_encoder.FinishPrepare();
-
 	// start off by writing the byte count as a uint32_t
-	temp_writer.Write<uint32_t>(rle_encoder.GetByteCount());
-	rle_encoder.BeginWrite(temp_writer, levels[offset]);
-	for (idx_t i = offset + 1; i < offset + count; i++) {
-		rle_encoder.WriteValue(temp_writer, levels[i]);
-	}
-	rle_encoder.FinishWrite(temp_writer);
+	temp_writer.Write<uint32_t>(rle_encoder.GetByteCount<uint16_t>(&levels[offset], count));
+	rle_encoder.WriteValues<uint16_t>(temp_writer, &levels[offset], count);
 }
 
 void BasicColumnWriter::NextPage(BasicColumnWriterState &state) {
@@ -1372,7 +1568,7 @@ public:
 					// write the bit-width as a one-byte entry
 					temp_writer.Write<uint8_t>(page_state.dict_bit_width);
 					// now begin writing the actual value
-					page_state.dict_encoder.BeginWrite(temp_writer, value_index);
+					page_state.dict_encoder.BeginWrite(temp_writer, value_index, chunk_end - chunk_start);
 					page_state.dict_written_value = true;
 				} else {
 					page_state.dict_encoder.WriteValue(temp_writer, value_index);
@@ -1785,7 +1981,7 @@ public:
 					// write the bit-width as a one-byte entry
 					temp_writer.Write<uint8_t>(bit_width);
 					// now begin writing the actual value
-					page_state.encoder.BeginWrite(temp_writer, ptr[r]);
+					page_state.encoder.BeginWrite(temp_writer, ptr[r], chunk_end - chunk_start);
 					page_state.written_value = true;
 				} else {
 					page_state.encoder.WriteValue(temp_writer, ptr[r]);
